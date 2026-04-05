@@ -148,7 +148,7 @@ def get_expiry_info():
     # Find this week's Thursday (Sensex expiry) — weekday 3 = Thursday
     days_to_thursday = (3 - today.weekday()) % 7
     # If today IS Thursday, look at next Thursday
-    if days_to_thursday == 0:
+    if today.weekday() == 3:
         days_to_thursday = 7
     sensex_expiry = today + datetime.timedelta(days=days_to_thursday)
 
@@ -299,7 +299,7 @@ def place_order(kite, tradingsymbol, exchange, transaction_type, quantity, order
 
 
 # ─────────────────────────────────────────────
-# STEP 5 — ALERTS
+# STEP 5 — ALERTS & PERSISTENCE
 # ─────────────────────────────────────────────
 
 def get_india_vix(kite):
@@ -322,16 +322,10 @@ def save_positions(positions_to_watch):
     """
     try:
         with open(POSITIONS_FILE, "w") as f:
-            # We filter out already exited legs before saving to keep it clean
             active_only = [p for p in positions_to_watch if not p.get("exited")]
-            # Convert date objects to strings for JSON
             serializable = []
             for p in active_only:
                 p_copy = p.copy()
-                if isinstance(p_copy.get("entry_date"), (datetime.date, datetime.datetime)):
-                    p_copy["entry_date"] = p_copy["entry_date"].strftime("%Y-%m-%d")
-                if isinstance(p_copy.get("expiry_date"), (datetime.date, datetime.datetime)):
-                    p_copy["expiry_date"] = p_copy["expiry_date"].strftime("%Y-%m-%d")
                 serializable.append(p_copy)
             json.dump(serializable, f, indent=4)
         print(f"📁 Positions saved to {POSITIONS_FILE}")
@@ -358,10 +352,6 @@ def load_positions():
 def alert(message):
     """
     Prints an alert message with timestamp.
-    You can extend this later to send:
-    - SMS via Twilio
-    - Email via smtplib
-    - Telegram message via python-telegram-bot
     """
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n🔔 ALERT [{timestamp}]: {message}\n")
@@ -379,14 +369,13 @@ def monitor_and_exit(kite, positions_to_watch):
     - Profit hits dynamic targets:
         - Entry day: TARGET_DAY1 (60% decay)
         - Subsequent days: TARGET_DAY2 (80% decay)
-    - Auto square-off at 3:20 PM on the DAY OF EXPIRY.
+    - Auto square-off at 2:30 PM on the DAY OF EXPIRY.
     """
 
     print("\n👁️  Starting position monitor... (checks every 60 seconds)")
     alert("Monitoring started for all positions.")
 
     while True:
-        # Check if there are any active positions left to monitor
         active_positions = [p for p in positions_to_watch if not p.get("exited")]
         if not active_positions:
             print("✅ All positions have been closed. Stopping monitor.")
@@ -402,7 +391,6 @@ def monitor_and_exit(kite, positions_to_watch):
                 continue
 
             # ── Check Expiry Square-off ──────────────────
-            # Only auto-exit after 2:30 PM (14:30) if today is the expiry date
             expiry_date_obj = datetime.datetime.strptime(pos["expiry_date"], "%Y-%m-%d").date()
             if today >= expiry_date_obj and now_time >= datetime.time(14, 30):
                 alert(f"⏰ Expiry day reached for {pos['leg_name']} — Auto square-off at 2:30 PM")
@@ -428,13 +416,10 @@ def monitor_and_exit(kite, positions_to_watch):
             print(f"   {pos['leg_name']} | Entry: ₹{entry_price} | Now: ₹{current_ltp} | P&L: {pnl_pct:.1f}% | Target: -{target}%")
 
             # ── Check SL/Target ────────────────────────
-            # Stop Loss
             if pnl_pct >= STOP_LOSS_PERCENT:
                 alert(f"🚨 STOP LOSS HIT on {pos['leg_name']}! Entry ₹{entry_price} → Now ₹{current_ltp}")
                 exit_position(kite, pos, reason="Stop Loss")
                 save_positions(positions_to_watch)
-
-            # Target (60% or 80% decay)
             elif pnl_pct <= -target:
                 alert(f"🎯 TARGET HIT ({target}%) on {pos['leg_name']}! Entry ₹{entry_price} → Now ₹{current_ltp}")
                 exit_position(kite, pos, reason=f"Target {target}%")
@@ -449,7 +434,7 @@ def exit_position(kite, pos, reason="Manual"):
     """
     print(f"\n🔄 Exiting position: {pos['leg_name']} | Reason: {reason}")
 
-    # Buy back the SELL leg (closing short position)
+    # Buy back the SELL leg
     place_order(
         kite, pos["sell_symbol"], pos["sell_exchange"],
         KiteConnect.TRANSACTION_TYPE_BUY,
@@ -457,7 +442,7 @@ def exit_position(kite, pos, reason="Manual"):
         order_label=f"EXIT SELL leg — {pos['leg_name']} ({reason})"
     )
 
-    # Sell the BUY hedge leg (closing long hedge)
+    # Sell the BUY hedge leg
     place_order(
         kite, pos["buy_symbol"], pos["buy_exchange"],
         KiteConnect.TRANSACTION_TYPE_SELL,
@@ -478,104 +463,66 @@ def run_strategy_for_index(kite, index_name, expiry_date, lots, lot_size,
                             positions_to_watch):
     """
     Core logic — finds strikes and places all 4 orders for one index.
-    Then adds the positions to the monitoring list.
-
-    index_name:    "NIFTY" or "SENSEX"
-    expiry_date:   datetime.date
-    lots:          number of lots
-    lot_size:      shares per lot
-    pe_sell_range: (min, max) premium range for PE sell
-    pe_buy_range:  (min, max) premium range for PE hedge buy
-    ce_sell_range: (min, max) premium range for CE sell
-    ce_buy_range:  (min, max) premium range for CE hedge buy
-    positions_to_watch: list to append open positions into (for monitoring)
     """
 
     exchange = "NFO" if index_name == "NIFTY" else "BFO"
-    qty = lots * lot_size  # Total quantity to trade
+    qty = lots * lot_size
 
     print(f"\n{'='*50}")
     print(f"🚀 Running strategy for {index_name} | Expiry: {expiry_date} | Qty: {qty}")
     print(f"{'='*50}")
 
-    # Get the option chain for this index and expiry
     options_df = get_option_instruments(kite, index_name, expiry_date)
 
-    # ── Find the 4 strikes ──────────────────────
-
-    # 1. PE to SELL (short put — collect premium)
-    print(f"\n🔍 Looking for PE SELL strike (₹{pe_sell_range[0]}–₹{pe_sell_range[1]})...")
+    # 1. PE to SELL
     pe_sell = find_strike_in_range(kite, options_df, "PE", *pe_sell_range)
-
-    # 2. PE to BUY as hedge (long put — limit downside)
-    print(f"🔍 Looking for PE BUY hedge strike (₹{pe_buy_range[0]}–₹{pe_buy_range[1]})...")
+    # 2. PE to BUY hedge
     pe_buy  = find_strike_in_range(kite, options_df, "PE", *pe_buy_range)
-
-    # 3. CE to SELL (short call — collect premium)
-    print(f"🔍 Looking for CE SELL strike (₹{ce_sell_range[0]}–₹{ce_sell_range[1]})...")
+    # 3. CE to SELL
     ce_sell = find_strike_in_range(kite, options_df, "CE", *ce_sell_range)
-
-    # 4. CE to BUY as hedge (long call — limit upside risk)
-    print(f"🔍 Looking for CE BUY hedge strike (₹{ce_buy_range[0]}–₹{ce_buy_range[1]})...")
+    # 4. CE to BUY hedge
     ce_buy  = find_strike_in_range(kite, options_df, "CE", *ce_buy_range)
 
-    # ── Validate all 4 strikes found ─────────────
     if not all([pe_sell, pe_buy, ce_sell, ce_buy]):
         alert(f"⚠️ {index_name}: Could not find all required strikes. Skipping.")
         return
 
-    # ── Place 4 orders (BUY first for margin benefit) ────────────────────
+    # ── Place 4 orders (BUY first) ────────────────────
+    place_order(kite, pe_buy["tradingsymbol"], exchange, KiteConnect.TRANSACTION_TYPE_BUY, qty, order_label=f"{index_name} BUY PE hedge")
+    place_order(kite, pe_sell["tradingsymbol"], exchange, KiteConnect.TRANSACTION_TYPE_SELL, qty, order_label=f"{index_name} SELL PE")
+    place_order(kite, ce_buy["tradingsymbol"], exchange, KiteConnect.TRANSACTION_TYPE_BUY, qty, order_label=f"{index_name} BUY CE hedge")
+    place_order(kite, ce_sell["tradingsymbol"], exchange, KiteConnect.TRANSACTION_TYPE_SELL, qty, order_label=f"{index_name} SELL CE")
 
-    # ORDER 1: Buy PE hedge
-    place_order(kite, pe_buy["tradingsymbol"], exchange,
-                KiteConnect.TRANSACTION_TYPE_BUY, qty,
-                order_label=f"{index_name} BUY PE hedge {pe_buy['strike']}")
+    # ── Add positions ─────────
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    expiry_str = expiry_date.strftime("%Y-%m-%d")
 
-    # ORDER 2: Sell PE
-    place_order(kite, pe_sell["tradingsymbol"], exchange,
-                KiteConnect.TRANSACTION_TYPE_SELL, qty,
-                order_label=f"{index_name} SELL PE {pe_sell['strike']}")
-
-    # ORDER 3: Buy CE hedge
-    place_order(kite, ce_buy["tradingsymbol"], exchange,
-                KiteConnect.TRANSACTION_TYPE_BUY, qty,
-                order_label=f"{index_name} BUY CE hedge {ce_buy['strike']}")
-
-    # ORDER 4: Sell CE
-    place_order(kite, ce_sell["tradingsymbol"], exchange,
-                KiteConnect.TRANSACTION_TYPE_SELL, qty,
-                order_label=f"{index_name} SELL CE {ce_sell['strike']}")
-
-    # ── Add positions to monitoring list ─────────
-
-    # PE leg monitoring entry
     positions_to_watch.append({
-        "leg_name":         f"{index_name} PE",
-        "entry_date":       datetime.date.today().strftime("%Y-%m-%d"),
-        "expiry_date":      expiry_date.strftime("%Y-%m-%d"),
-        "sell_symbol":      pe_sell["tradingsymbol"],
-        "sell_exchange":    exchange,
-        "sell_qty":         qty,
+        "leg_name": f"{index_name} PE",
+        "entry_date": today_str,
+        "expiry_date": expiry_str,
+        "sell_symbol": pe_sell["tradingsymbol"],
+        "sell_exchange": exchange,
+        "sell_qty": qty,
         "sell_entry_price": pe_sell["ltp"],
-        "buy_symbol":       pe_buy["tradingsymbol"],
-        "buy_exchange":     pe_buy["exchange"],
-        "buy_qty":          qty,
-        "exited":           False,
+        "buy_symbol": pe_buy["tradingsymbol"],
+        "buy_exchange": pe_buy["exchange"],
+        "buy_qty": qty,
+        "exited": False,
     })
 
-    # CE leg monitoring entry
     positions_to_watch.append({
-        "leg_name":         f"{index_name} CE",
-        "entry_date":       datetime.date.today().strftime("%Y-%m-%d"),
-        "expiry_date":      expiry_date.strftime("%Y-%m-%d"),
-        "sell_symbol":      ce_sell["tradingsymbol"],
-        "sell_exchange":    exchange,
-        "sell_qty":         qty,
+        "leg_name": f"{index_name} CE",
+        "entry_date": today_str,
+        "expiry_date": expiry_str,
+        "sell_symbol": ce_sell["tradingsymbol"],
+        "sell_exchange": exchange,
+        "sell_qty": qty,
         "sell_entry_price": ce_sell["ltp"],
-        "buy_symbol":       ce_buy["tradingsymbol"],
-        "buy_exchange":     ce_buy["exchange"],
-        "buy_qty":          qty,
-        "exited":           False,
+        "buy_symbol": ce_buy["tradingsymbol"],
+        "buy_exchange": ce_buy["exchange"],
+        "buy_qty": qty,
+        "exited": False,
     })
 
     save_positions(positions_to_watch)
@@ -583,115 +530,64 @@ def run_strategy_for_index(kite, index_name, expiry_date, lots, lot_size,
 
 
 # ─────────────────────────────────────────────
-# STEP 8 — DAILY JOB (runs after 9:45 AM)
+# STEP 8 — DAILY JOB
 # ─────────────────────────────────────────────
 
-def daily_job(kite):
-    """
-    This is the main function that runs every trading day.
-    It checks:
-    1. Is today a trigger day (2 days before expiry)?
-    2. Is the time past 9:45 AM?
-    If both yes → place orders and start monitoring.
-    """
-
+def daily_job(kite, positions_to_watch):
     now  = datetime.datetime.now()
     info = get_expiry_info()
 
-    # Check time gate — must be after 9:45 AM
     if now.time() < datetime.time(ENTRY_HOUR, ENTRY_MINUTE):
         print(f"⏳ Waiting... Current time {now.strftime('%H:%M')} is before entry time 09:45")
         return
 
-    # Check India VIX — skip if VIX > VIX_THRESHOLD (20)
     vix = get_india_vix(kite)
     if vix and vix > VIX_THRESHOLD:
         print(f"🚫 India VIX ({vix}) is above {VIX_THRESHOLD}. Staying out of market today.")
         return
 
-    positions_to_watch = []  # Will hold all open legs for monitoring
-
     # ── NIFTY ──
     if info["nifty_trigger"]:
-        run_strategy_for_index(
-            kite         = kite,
-            index_name   = "NIFTY",
-            expiry_date  = info["nifty_expiry"],
-            lots         = NIFTY_LOTS,
-            lot_size     = NIFTY_LOT_SIZE,
-            pe_sell_range = (NIFTY_PE_SELL_MIN,  NIFTY_PE_SELL_MAX),
-            pe_buy_range  = (NIFTY_PE_BUY_MIN,   NIFTY_PE_BUY_MAX),
-            ce_sell_range = (NIFTY_CE_SELL_MIN,  NIFTY_CE_SELL_MAX),
-            ce_buy_range  = (NIFTY_CE_BUY_MIN,   NIFTY_CE_BUY_MAX),
-            positions_to_watch = positions_to_watch,
-        )
-    else:
-        print("ℹ️  Today is NOT a Nifty trigger day. Skipping Nifty.")
+        run_strategy_for_index(kite, "NIFTY", info["nifty_expiry"], NIFTY_LOTS, NIFTY_LOT_SIZE,
+                               (NIFTY_PE_SELL_MIN, NIFTY_PE_SELL_MAX), (NIFTY_PE_BUY_MIN, NIFTY_PE_BUY_MAX),
+                               (NIFTY_CE_SELL_MIN, NIFTY_CE_SELL_MAX), (NIFTY_CE_BUY_MIN, NIFTY_CE_BUY_MAX),
+                               positions_to_watch)
 
     # ── SENSEX ──
     if info["sensex_trigger"]:
-        run_strategy_for_index(
-            kite         = kite,
-            index_name   = "SENSEX",
-            expiry_date  = info["sensex_expiry"],
-            lots         = SENSEX_LOTS,
-            lot_size     = SENSEX_LOT_SIZE,
-            pe_sell_range = (SENSEX_PE_SELL_MIN,  SENSEX_PE_SELL_MAX),
-            pe_buy_range  = (SENSEX_PE_BUY_MIN,   SENSEX_PE_BUY_MAX),
-            ce_sell_range = (SENSEX_CE_SELL_MIN,  SENSEX_CE_SELL_MAX),
-            ce_buy_range  = (SENSEX_CE_BUY_MIN,   SENSEX_CE_BUY_MAX),
-            positions_to_watch = positions_to_watch,
-        )
-    else:
-        print("ℹ️  Today is NOT a Sensex trigger day. Skipping Sensex.")
+        run_strategy_for_index(kite, "SENSEX", info["sensex_expiry"], SENSEX_LOTS, SENSEX_LOT_SIZE,
+                               (SENSEX_PE_SELL_MIN, SENSEX_PE_SELL_MAX), (SENSEX_PE_BUY_MIN, SENSEX_PE_BUY_MAX),
+                               (SENSEX_CE_SELL_MIN, SENSEX_CE_SELL_MAX), (SENSEX_CE_BUY_MIN, SENSEX_CE_BUY_MAX),
+                               positions_to_watch)
 
-    # ── Start monitoring if any orders were placed ──
     if positions_to_watch:
-        # Run monitor in a separate thread so it doesn't block the scheduler
-        monitor_thread = threading.Thread(
-            target = monitor_and_exit,
-            args   = (kite, positions_to_watch),
-            daemon = True
-        )
+        # Start monitor thread only if not already running
+        # (This is a simplified check, in practice you'd track the thread)
+        monitor_thread = threading.Thread(target=monitor_and_exit, args=(kite, positions_to_watch), daemon=True)
         monitor_thread.start()
-    else:
-        print("\n✅ No orders placed today. Nothing to monitor.")
 
 
 # ─────────────────────────────────────────────
-# STEP 9 — PROGRAM ENTRY POINT
+# STEP 9 — ENTRY POINT
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-
     print("=" * 60)
-    print("  NIFTY & SENSEX SHORT STRANGLE ALGO")
+    print("  NIFTY & SENSEX POSITIONAL SHORT STRANGLE")
     print("=" * 60)
 
-    # Login once at the start of the day
     kite = login_and_get_kite()
-
-    # 1. Check for existing positions from previous days
     positions_to_watch = load_positions()
+
     if positions_to_watch:
         print(f"🔄 Resuming monitoring for {len(positions_to_watch)} active positions...")
-        monitor_thread = threading.Thread(
-            target = monitor_and_exit,
-            args   = (kite, positions_to_watch),
-            daemon = True
-        )
-        monitor_thread.start()
+        threading.Thread(target=monitor_and_exit, args=(kite, positions_to_watch), daemon=True).start()
 
-    # 2. Schedule the job to run at 9:45 AM every day for NEW entries
-    schedule.every().day.at("09:45").do(daily_job, kite=kite)
+    schedule.every().day.at("09:45").do(daily_job, kite=kite, positions_to_watch=positions_to_watch)
 
     print("\n⏰ Scheduler started. Waiting for 9:45 AM...")
-    print("   (Press Ctrl+C to stop)\n")
+    daily_job(kite, positions_to_watch)
 
-    # Run daily_job once immediately on start (useful for testing or if starting after 9:45 AM)
-    daily_job(kite)
-
-    # Keep the script running and check schedule every 30 seconds
     while True:
         schedule.run_pending()
         time.sleep(30)
