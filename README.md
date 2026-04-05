@@ -16,7 +16,7 @@ This Python-based trading algorithm automates a Short Strangle strategy with hed
         - Subsequent Days: 80% premium decay.
     - **Stop Loss:** 100% loss on sold premium (exit if premium doubles).
     - **Individual Exit:** Each leg (CE/PE) is managed and exited independently when its specific target or SL is hit.
-    - **Expiry Exit:** Automatically squares off open positions at 3:20 PM ONLY on the day of expiry.
+    - **Expiry Exit:** Automatically squares off open positions at 2:30 PM (14:30) ONLY on the day of expiry.
     - **Persistence:** Open positions are saved to `open_positions.json` so the algo can resume monitoring after a restart.
 
 ## Premium Ranges

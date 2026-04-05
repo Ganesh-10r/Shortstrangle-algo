@@ -402,10 +402,10 @@ def monitor_and_exit(kite, positions_to_watch):
                 continue
 
             # ── Check Expiry Square-off ──────────────────
-            # Only auto-exit at 3:20 PM if today is the expiry date
+            # Only auto-exit after 2:30 PM (14:30) if today is the expiry date
             expiry_date_obj = datetime.datetime.strptime(pos["expiry_date"], "%Y-%m-%d").date()
-            if today >= expiry_date_obj and now_time >= datetime.time(15, 20):
-                alert(f"⏰ Expiry day reached for {pos['leg_name']} — Auto square-off at 3:20 PM")
+            if today >= expiry_date_obj and now_time >= datetime.time(14, 30):
+                alert(f"⏰ Expiry day reached for {pos['leg_name']} — Auto square-off at 2:30 PM")
                 exit_position(kite, pos, reason="Expiry Day Auto Square Off")
                 save_positions(positions_to_watch)
                 continue

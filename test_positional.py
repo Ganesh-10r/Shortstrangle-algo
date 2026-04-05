@@ -94,5 +94,34 @@ class TestPositionalLogic(unittest.TestCase):
 
         mock_exit.assert_called_with(mock_kite, positions[0], reason="Target 80%")
 
+    @patch('nifty_sensex_algo.exit_position')
+    @patch('nifty_sensex_algo.datetime')
+    def test_expiry_exit_at_1430(self, mock_dt, mock_exit):
+        mock_kite = MagicMock()
+        expiry_today = datetime.date.today().strftime("%Y-%m-%d")
+        positions = [{
+            "leg_name": "NIFTY PE",
+            "entry_date": "2023-10-23",
+            "expiry_date": expiry_today,
+            "sell_symbol": "PE",
+            "sell_exchange": "NFO",
+            "sell_entry_price": 100,
+            "exited": False
+        }]
+
+        # Mock time as 2:31 PM (14:31) and today's date
+        mock_dt.datetime.now.return_value.time.return_value = datetime.time(14, 31)
+        mock_dt.date.today.return_value = datetime.date.today()
+        mock_dt.datetime.strptime = datetime.datetime.strptime # keep real strptime
+        mock_dt.time = datetime.time
+
+        with patch('time.sleep', side_effect=[None, InterruptedError]):
+            try:
+                nifty_sensex_algo.monitor_and_exit(mock_kite, positions)
+            except InterruptedError:
+                pass
+
+        mock_exit.assert_called_with(mock_kite, positions[0], reason="Expiry Day Auto Square Off")
+
 if __name__ == '__main__':
     unittest.main()
