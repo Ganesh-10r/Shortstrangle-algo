@@ -33,6 +33,8 @@ import time
 import datetime
 import webbrowser
 import threading
+import json
+import os
 
 import schedule
 import pandas as pd
@@ -70,10 +72,14 @@ SENSEX_CE_BUY_MIN,  SENSEX_CE_BUY_MAX  = 30, 50
 
 # Exit rules
 STOP_LOSS_PERCENT = 100    # Exit if sold premium doubles (100% loss on premium)
-TARGET_PERCENT    = 50     # Exit if 50% of premium is captured as profit
+TARGET_DAY1       = 60     # 60% decay target on entry day
+TARGET_DAY2       = 80     # 80% decay target on subsequent days
 
 # VIX threshold
 VIX_THRESHOLD = 20
+
+# Persistence file
+POSITIONS_FILE = "open_positions.json"
 
 
 # ─────────────────────────────────────────────
@@ -280,7 +286,7 @@ def place_order(kite, tradingsymbol, exchange, transaction_type, quantity, order
             transaction_type = transaction_type,
             quantity    = quantity,
             order_type  = kite.ORDER_TYPE_MARKET,   # Market order for fast execution
-            product     = kite.PRODUCT_MIS,         # MIS = intraday margin product
+            product     = kite.PRODUCT_NRML,        # NRML = positional / overnight product
         )
         print(f"   ✅ Order placed! Order ID: {order_id}")
         alert(f"ORDER PLACED: {order_label} | {tradingsymbol} | Qty {quantity} | ID {order_id}")
@@ -310,6 +316,45 @@ def get_india_vix(kite):
         return None
 
 
+def save_positions(positions_to_watch):
+    """
+    Saves current open positions to a JSON file for persistence.
+    """
+    try:
+        with open(POSITIONS_FILE, "w") as f:
+            # We filter out already exited legs before saving to keep it clean
+            active_only = [p for p in positions_to_watch if not p.get("exited")]
+            # Convert date objects to strings for JSON
+            serializable = []
+            for p in active_only:
+                p_copy = p.copy()
+                if isinstance(p_copy.get("entry_date"), (datetime.date, datetime.datetime)):
+                    p_copy["entry_date"] = p_copy["entry_date"].strftime("%Y-%m-%d")
+                if isinstance(p_copy.get("expiry_date"), (datetime.date, datetime.datetime)):
+                    p_copy["expiry_date"] = p_copy["expiry_date"].strftime("%Y-%m-%d")
+                serializable.append(p_copy)
+            json.dump(serializable, f, indent=4)
+        print(f"📁 Positions saved to {POSITIONS_FILE}")
+    except Exception as e:
+        print(f"⚠️ Error saving positions: {e}")
+
+
+def load_positions():
+    """
+    Loads open positions from the JSON file.
+    """
+    if not os.path.exists(POSITIONS_FILE):
+        return []
+    try:
+        with open(POSITIONS_FILE, "r") as f:
+            data = json.load(f)
+            print(f"📁 Loaded {len(data)} existing positions from {POSITIONS_FILE}")
+            return data
+    except Exception as e:
+        print(f"⚠️ Error loading positions: {e}")
+        return []
+
+
 def alert(message):
     """
     Prints an alert message with timestamp.
@@ -328,56 +373,72 @@ def alert(message):
 
 def monitor_and_exit(kite, positions_to_watch):
     """
-    Monitors all open positions after entry.
+    Monitors all open positions. Supports multi-day monitoring.
     Exits if:
-    - Loss on sold premium > STOP_LOSS_PERCENT (e.g., premium doubled)
-    - Profit on sold premium > TARGET_PERCENT  (e.g., 50% of premium captured)
-
-    positions_to_watch: list of dicts with keys:
-        sell_symbol, sell_exchange, sell_qty, sell_entry_price,
-        buy_symbol,  buy_exchange,  buy_qty,  buy_entry_price,
-        leg_name (just a label like "NIFTY PE")
+    - Loss on sold premium > STOP_LOSS_PERCENT
+    - Profit hits dynamic targets:
+        - Entry day: TARGET_DAY1 (60% decay)
+        - Subsequent days: TARGET_DAY2 (80% decay)
+    - Auto square-off at 3:20 PM on the DAY OF EXPIRY.
     """
 
     print("\n👁️  Starting position monitor... (checks every 60 seconds)")
     alert("Monitoring started for all positions.")
 
     while True:
-        time.sleep(60)  # Check every 1 minute
-
-        now = datetime.datetime.now().time()
-
-        # Auto square off at 3:20 PM if positions still open (before 3:30 PM MIS cutoff)
-        if now >= datetime.time(15, 20):
-            print("\n⏰ 3:20 PM reached — squaring off all positions!")
-            alert("AUTO SQUARE OFF at 3:20 PM")
-            for pos in positions_to_watch:
-                if not pos.get("exited"):
-                    exit_position(kite, pos, reason="EOD Auto Square Off")
+        # Check if there are any active positions left to monitor
+        active_positions = [p for p in positions_to_watch if not p.get("exited")]
+        if not active_positions:
+            print("✅ All positions have been closed. Stopping monitor.")
             break
+
+        time.sleep(60)
+
+        today = datetime.date.today()
+        now_time = datetime.datetime.now().time()
 
         for pos in positions_to_watch:
             if pos.get("exited"):
-                continue  # Already exited this leg
+                continue
 
-            # Get current LTP of sold option
-            sell_quote  = kite.quote([f"{pos['sell_exchange']}:{pos['sell_symbol']}"])
-            current_ltp = sell_quote[f"{pos['sell_exchange']}:{pos['sell_symbol']}"]["last_price"]
+            # ── Check Expiry Square-off ──────────────────
+            # Only auto-exit at 3:20 PM if today is the expiry date
+            expiry_date_obj = datetime.datetime.strptime(pos["expiry_date"], "%Y-%m-%d").date()
+            if today >= expiry_date_obj and now_time >= datetime.time(15, 20):
+                alert(f"⏰ Expiry day reached for {pos['leg_name']} — Auto square-off at 3:20 PM")
+                exit_position(kite, pos, reason="Expiry Day Auto Square Off")
+                save_positions(positions_to_watch)
+                continue
+
+            # ── Fetch P&L ──────────────────────────────
+            try:
+                sell_quote  = kite.quote([f"{pos['sell_exchange']}:{pos['sell_symbol']}"])
+                current_ltp = sell_quote[f"{pos['sell_exchange']}:{pos['sell_symbol']}"]["last_price"]
+            except Exception as e:
+                print(f"⚠️ Error fetching quote for {pos['sell_symbol']}: {e}")
+                continue
 
             entry_price = pos["sell_entry_price"]
             pnl_pct     = ((current_ltp - entry_price) / entry_price) * 100
 
-            print(f"   {pos['leg_name']} | Entry: ₹{entry_price} | Now: ₹{current_ltp} | P&L: {pnl_pct:.1f}%")
+            # ── Determine Target ───────────────────────
+            entry_date_obj = datetime.datetime.strptime(pos["entry_date"], "%Y-%m-%d").date()
+            target = TARGET_DAY1 if today == entry_date_obj else TARGET_DAY2
 
-            # Stop Loss — LTP rose above entry by SL%
+            print(f"   {pos['leg_name']} | Entry: ₹{entry_price} | Now: ₹{current_ltp} | P&L: {pnl_pct:.1f}% | Target: -{target}%")
+
+            # ── Check SL/Target ────────────────────────
+            # Stop Loss
             if pnl_pct >= STOP_LOSS_PERCENT:
                 alert(f"🚨 STOP LOSS HIT on {pos['leg_name']}! Entry ₹{entry_price} → Now ₹{current_ltp}")
                 exit_position(kite, pos, reason="Stop Loss")
+                save_positions(positions_to_watch)
 
-            # Target — LTP fell below entry by TARGET%
-            elif pnl_pct <= -TARGET_PERCENT:
-                alert(f"🎯 TARGET HIT on {pos['leg_name']}! Entry ₹{entry_price} → Now ₹{current_ltp}")
-                exit_position(kite, pos, reason="Target")
+            # Target (60% or 80% decay)
+            elif pnl_pct <= -target:
+                alert(f"🎯 TARGET HIT ({target}%) on {pos['leg_name']}! Entry ₹{entry_price} → Now ₹{current_ltp}")
+                exit_position(kite, pos, reason=f"Target {target}%")
+                save_positions(positions_to_watch)
 
 
 def exit_position(kite, pos, reason="Manual"):
@@ -490,6 +551,8 @@ def run_strategy_for_index(kite, index_name, expiry_date, lots, lot_size,
     # PE leg monitoring entry
     positions_to_watch.append({
         "leg_name":         f"{index_name} PE",
+        "entry_date":       datetime.date.today().strftime("%Y-%m-%d"),
+        "expiry_date":      expiry_date.strftime("%Y-%m-%d"),
         "sell_symbol":      pe_sell["tradingsymbol"],
         "sell_exchange":    exchange,
         "sell_qty":         qty,
@@ -503,6 +566,8 @@ def run_strategy_for_index(kite, index_name, expiry_date, lots, lot_size,
     # CE leg monitoring entry
     positions_to_watch.append({
         "leg_name":         f"{index_name} CE",
+        "entry_date":       datetime.date.today().strftime("%Y-%m-%d"),
+        "expiry_date":      expiry_date.strftime("%Y-%m-%d"),
         "sell_symbol":      ce_sell["tradingsymbol"],
         "sell_exchange":    exchange,
         "sell_qty":         qty,
@@ -513,6 +578,7 @@ def run_strategy_for_index(kite, index_name, expiry_date, lots, lot_size,
         "exited":           False,
     })
 
+    save_positions(positions_to_watch)
     alert(f"✅ All 4 orders placed for {index_name}!")
 
 
@@ -605,14 +671,24 @@ if __name__ == "__main__":
     # Login once at the start of the day
     kite = login_and_get_kite()
 
-    # Schedule the job to run at 9:45 AM every day
-    # You can also run it immediately below for testing
+    # 1. Check for existing positions from previous days
+    positions_to_watch = load_positions()
+    if positions_to_watch:
+        print(f"🔄 Resuming monitoring for {len(positions_to_watch)} active positions...")
+        monitor_thread = threading.Thread(
+            target = monitor_and_exit,
+            args   = (kite, positions_to_watch),
+            daemon = True
+        )
+        monitor_thread.start()
+
+    # 2. Schedule the job to run at 9:45 AM every day for NEW entries
     schedule.every().day.at("09:45").do(daily_job, kite=kite)
 
     print("\n⏰ Scheduler started. Waiting for 9:45 AM...")
     print("   (Press Ctrl+C to stop)\n")
 
-    # Run once immediately on start too (useful for testing after 9:45 AM)
+    # Run daily_job once immediately on start (useful for testing or if starting after 9:45 AM)
     daily_job(kite)
 
     # Keep the script running and check schedule every 30 seconds
