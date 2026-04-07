@@ -40,7 +40,7 @@ This Python-based trading algorithm automates a Short Strangle strategy with hed
 *   **State Persistence:** Loads any active trades from `open_positions.json` to ensure monitoring resumes immediately across script restarts.
 
 ### 2. Schedule & Timing
-*   **Polling Frequency:** The algorithm now runs **every 1 minute**.
+*   **Polling Frequency:** The algorithm now runs **every 5 seconds**.
 *   **Entry Window:** It starts checking for new trades only after **9:45 AM**.
 *   **Index Trigger Days:**
     *   **NIFTY:** Triggers only on **Mondays** (1 day before Tuesday weekly expiry).
@@ -72,7 +72,7 @@ For each leg (PE and CE), it follows this precise selection process:
 *   **Product Type:** All trades are placed as **NRML** (Positional) to allow for overnight holding.
 
 ### 7. Position Monitoring & Exit Rules
-A background process monitors each open leg individually every 60 seconds:
+A background process monitors each open leg individually every 5 seconds:
 *   **Stop Loss (SL):** If the premium of a sold option increases by **100%** (it doubles), the leg is exited immediately.
 *   **Dynamic Profit Targets:**
     *   **Day 1 (Entry Day):** Exits if the premium decays by **60%**.

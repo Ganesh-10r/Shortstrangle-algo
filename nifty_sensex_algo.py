@@ -85,6 +85,12 @@ POSITIONS_FILE = "open_positions.json"
 # Thread safety
 positions_lock = Lock()
 
+# Global cache for instruments
+cached_instruments = {
+    "NIFTY": {"df": None, "expiry": None},
+    "SENSEX": {"df": None, "expiry": None}
+}
+
 
 # ─────────────────────────────────────────────
 # STEP 1 — LOGIN & CONNECT TO ZERODHA
@@ -180,10 +186,17 @@ def get_option_instruments(kite, index_name, expiry_date):
     """
     Downloads the full list of instruments from Zerodha for the given index.
     Filters to only options expiring on the given date.
+    Uses caching to avoid repeated full downloads.
 
     index_name: "NIFTY" or "SENSEX"
     expiry_date: datetime.date object
     """
+    global cached_instruments
+
+    # Check if we already have the correct instruments cached for today/this expiry
+    if (cached_instruments[index_name]["df"] is not None and
+        cached_instruments[index_name]["expiry"] == expiry_date):
+        return cached_instruments[index_name]["df"]
 
     print(f"📡 Fetching instruments for {index_name} expiry {expiry_date}...")
 
@@ -202,6 +215,10 @@ def get_option_instruments(kite, index_name, expiry_date):
     )
     options_df = df[mask].copy()
     options_df = options_df.sort_values("strike").reset_index(drop=True)
+
+    # Update cache
+    cached_instruments[index_name]["df"] = options_df
+    cached_instruments[index_name]["expiry"] = expiry_date
 
     print(f"   Found {len(options_df)} option strikes for {index_name}\n")
     return options_df
@@ -482,11 +499,11 @@ def monitor_and_exit(kite, positions_to_watch):
     - Auto square-off at 2:30 PM on the DAY OF EXPIRY.
     """
 
-    print("\n👁️  Starting position monitor... (checks every 60 seconds)")
+    print("\n👁️  Starting position monitor... (checks every 5 seconds)")
     alert("Monitoring started for all positions.")
 
     while True:
-        time.sleep(60)
+        time.sleep(5)
 
         with positions_lock:
             active_positions = [p for p in positions_to_watch if not p.get("exited")]
@@ -713,10 +730,10 @@ if __name__ == "__main__":
         _MONITOR_STARTED = True
         threading.Thread(target=monitor_and_exit, args=(kite, positions_to_watch), daemon=True).start()
 
-    # Run every minute to check conditions
-    schedule.every(1).minutes.do(daily_job, kite=kite, positions_to_watch=positions_to_watch)
+    # Run every 5 seconds to check conditions
+    schedule.every(5).seconds.do(daily_job, kite=kite, positions_to_watch=positions_to_watch)
 
-    print("\n⏰ Scheduler started. Running every 1 minute...")
+    print("\n⏰ Scheduler started. Running every 5 seconds...")
     daily_job(kite, positions_to_watch)
 
     while True:
