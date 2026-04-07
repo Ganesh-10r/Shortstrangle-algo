@@ -33,6 +33,7 @@ import time
 import datetime
 import webbrowser
 import threading
+from threading import Lock
 import json
 import os
 
@@ -80,6 +81,9 @@ VIX_THRESHOLD = 20
 
 # Persistence file
 POSITIONS_FILE = "open_positions.json"
+
+# Thread safety
+positions_lock = Lock()
 
 
 # ─────────────────────────────────────────────
@@ -425,17 +429,18 @@ def save_positions(positions_to_watch):
     """
     Saves current open positions to a JSON file for persistence.
     """
-    try:
-        with open(POSITIONS_FILE, "w") as f:
-            active_only = [p for p in positions_to_watch if not p.get("exited")]
-            serializable = []
-            for p in active_only:
-                p_copy = p.copy()
-                serializable.append(p_copy)
-            json.dump(serializable, f, indent=4)
-        print(f"📁 Positions saved to {POSITIONS_FILE}")
-    except Exception as e:
-        print(f"⚠️ Error saving positions: {e}")
+    with positions_lock:
+        try:
+            with open(POSITIONS_FILE, "w") as f:
+                active_only = [p for p in positions_to_watch if not p.get("exited")]
+                serializable = []
+                for p in active_only:
+                    p_copy = p.copy()
+                    serializable.append(p_copy)
+                json.dump(serializable, f, indent=4)
+            print(f"📁 Positions saved to {POSITIONS_FILE}")
+        except Exception as e:
+            print(f"⚠️ Error saving positions: {e}")
 
 
 def load_positions():
@@ -481,17 +486,23 @@ def monitor_and_exit(kite, positions_to_watch):
     alert("Monitoring started for all positions.")
 
     while True:
-        active_positions = [p for p in positions_to_watch if not p.get("exited")]
-        if not active_positions:
-            print("✅ All positions have been closed. Stopping monitor.")
-            break
-
         time.sleep(60)
+
+        with positions_lock:
+            active_positions = [p for p in positions_to_watch if not p.get("exited")]
+
+        if not active_positions:
+            # We don't break here because we might enter new legs later today
+            continue
 
         today = datetime.date.today()
         now_time = datetime.datetime.now().time()
 
-        for pos in positions_to_watch:
+        # Iterate over a copy to avoid issues if positions_to_watch is modified
+        with positions_lock:
+            monitored_list = list(positions_to_watch)
+
+        for pos in monitored_list:
             if pos.get("exited"):
                 continue
 
@@ -527,6 +538,7 @@ def monitor_and_exit(kite, positions_to_watch):
                 save_positions(positions_to_watch)
             elif pnl_pct <= -target:
                 alert(f"🎯 TARGET HIT ({target}%) on {pos['leg_name']}! Entry ₹{entry_price} → Now ₹{current_ltp}")
+                # exit_position modifies pos['exited'] which is fine since we have the object reference
                 exit_position(kite, pos, reason=f"Target {target}%")
                 save_positions(positions_to_watch)
 
@@ -573,9 +585,10 @@ def check_and_enter_leg(kite, index_name, expiry_date, leg_type, qty,
     today_str = datetime.date.today().strftime("%Y-%m-%d")
 
     # Check if already entered today
-    for pos in positions_to_watch:
-        if pos["leg_name"] == leg_name and pos["entry_date"] == today_str:
-            return False # Already entered
+    with positions_lock:
+        for pos in positions_to_watch:
+            if pos["leg_name"] == leg_name and pos["entry_date"] == today_str:
+                return False # Already entered
 
     print(f"🔎 Checking entry for {leg_name}...")
 
@@ -598,19 +611,20 @@ def check_and_enter_leg(kite, index_name, expiry_date, leg_type, qty,
 
     # 4. Add to positions
     expiry_str = expiry_date.strftime("%Y-%m-%d")
-    positions_to_watch.append({
-        "leg_name": leg_name,
-        "entry_date": today_str,
-        "expiry_date": expiry_str,
-        "sell_symbol": sell_strike["tradingsymbol"],
-        "sell_exchange": exchange,
-        "sell_qty": qty,
-        "sell_entry_price": sell_strike["ltp"],
-        "buy_symbol": buy_strike["tradingsymbol"],
-        "buy_exchange": buy_strike["exchange"],
-        "buy_qty": qty,
-        "exited": False,
-    })
+    with positions_lock:
+        positions_to_watch.append({
+            "leg_name": leg_name,
+            "entry_date": today_str,
+            "expiry_date": expiry_str,
+            "sell_symbol": sell_strike["tradingsymbol"],
+            "sell_exchange": exchange,
+            "sell_qty": qty,
+            "sell_entry_price": sell_strike["ltp"],
+            "buy_symbol": buy_strike["tradingsymbol"],
+            "buy_exchange": buy_strike["exchange"],
+            "buy_qty": qty,
+            "exited": False,
+        })
 
     save_positions(positions_to_watch)
     alert(f"✅ {leg_name} entry completed!")
